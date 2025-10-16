@@ -1,0 +1,301 @@
+#version 1.0
+import ibm_db
+import pandas as pd
+import ibm_db_dbi
+#import pyodbc
+import openpyxl
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
+from email import encoders
+from datetime import date
+from dateutil.relativedelta import relativedelta, MO
+import requests
+path = os.getcwd()
+
+
+#print("your path is {}".format(path))
+
+
+dsn= "DATABASE=MWNCDSNB;HOSTNAME=bldbmsa.boulder.ibm.com;PORT=5508;PROTOCOL=TCPIP;UID=BNARA04;PWD=Bangalore560101;SECURITY=SSL"
+cnxn = ibm_db.connect(dsn, "", "")
+query = "SELECT DISTINCT ( A.SRC_LOCAL_BAND_EFFCTV_DT ), A.SRC_LOCAL_BAND_CD, \
+     ( A.EMP_SER_NUM ), A.SRC_LAST_NM, A.SRC_FIRST_NM, A.SRC_DPT_ID \
+FROM WORKER.SOURCE_WORKER_UV A \
+WHERE (A.SRC_LOCAL_BAND_EFFCTV_DT >= '2024-12-28') and SRC_SAP_CMPNY_CD in ('0063') \
+     AND ((A.SRC_ISO_CTRY_CD = 'IN'))\
+     AND (NOT( A.SRC_DPT_ID LIKE 'J%' OR A.SRC_DPT_ID LIKE 'W%' OR A.SRC_DPT_ID LIKE 'R%' )) \
+     AND (A.SRC_LOCAL_BAND_EFFCTV_DT > A.SRC_JOIN_DT) \
+     AND (NOT(A.SRC_EMP_TYPE_CD = 'CT')) order by  A.SRC_LOCAL_BAND_EFFCTV_DT "
+
+conn1 = ibm_db_dbi.Connection(cnxn)
+tableResult = pd.read_sql(query,conn1)
+len(tableResult)
+Source_worker=pd.DataFrame(tableResult)
+Source_worker['WEEKENDING'] = Source_worker['SRC_LOCAL_BAND_EFFCTV_DT'].astype('str')
+print(Source_worker.dtypes)
+Source_worker.SRC_LOCAL_BAND_CD = Source_worker.SRC_LOCAL_BAND_CD.str.strip()
+print(Source_worker.head())
+Source_worker.SRC_LOCAL_BAND_CD.unique()
+os.chdir(path+ "/input")
+band_map = pd.read_excel("Bandmapping.xlsx")
+
+band_map = pd.DataFrame(band_map)
+
+band_map.SRC_LOCAL_BAND_CD = band_map.SRC_LOCAL_BAND_CD.astype(str)
+
+band_map.SRC_LOCAL_BAND_CD.unique()
+
+df_new = pd.merge(Source_worker,band_map,on= 'SRC_LOCAL_BAND_CD',how='left')
+df_new = pd.DataFrame(df_new)
+
+
+df_new.to_excel('Source Worker.xlsx',engine='xlsxwriter', index=False)
+
+emp_list = tuple(df_new.EMP_SER_NUM.unique())
+
+dsn= "DATABASE=MWNCDSNB;HOSTNAME=bldbmsa.boulder.ibm.com;PORT=5508;PROTOCOL=TCPIP;UID=BNARA04;PWD=Bangalore560101;SECURITY=SSL"
+cnxn = ibm_db.connect(dsn, "", "")
+
+query = f"SELECT A.COUNTRY_CODE, A.COMPANY_CODE, A.EMP_SER_NUM, A.EMP_LAST_NAME,A.EMP_LEVEL_CODE, A.JOB_FAMILY_CODE, A.BURDEN_CD, A.EMP_DISCON_DATE FROM BMSIW.EMP_MASTER_FILE_UV A \
+WHERE \
+   EMP_SER_NUM in {emp_list} \
+   and A.COUNTRY_CODE = '709' \
+   and A.COMPANY_CODE in ('IGSI','INUSB','NETSOL')"
+# print(query)
+conn1 = ibm_db_dbi.Connection(cnxn)
+tableResult = pd.read_sql(query,conn1)
+EMF_DATA=pd.DataFrame(tableResult)
+EMF_DATA['COMPANY_CODE'] = EMF_DATA.COMPANY_CODE.str.strip()
+#EMF_DATA.to_excel(r'EMF_MASTER.xlsx',index= None,header=True)
+EMF_DATA_AND_SOURCE = pd.merge(df_new,EMF_DATA, on='EMP_SER_NUM', how='outer')
+EMF_DATA_AND_SOURCE.to_excel(r'EMF_MASTER with SOURCE.xlsx',index= None,header=True)
+
+
+def sqlrun():
+    global finaldf
+    df = newdf
+    df = pd.DataFrame(df)
+    Account_list = tuple(df['EMP_SER_NUM'].unique())
+    weeks = df['WEEKENDING'].unique()
+    week_end_date = weeks[0]
+    #print(len(Account_list))
+    query = f"""
+    SELECT A.EMP_SER_NUM, A.ACCOUNT_ID, A.WEEK_ENDING_DATE, A.EMP_COMPANY_CODE, A.EMP_DEPT_NUMBER, A.ACTIVITY_CD, 
+           SUM(A.TOTAL_HRS_EXPENDED) AS TOTAL_HRS_EXPENDED, A.EMP_LEVEL_CODE, B.RQSTR_EMAIL,
+           A.JOB_FAMILY_CODE, A.OVERTIME_IND
+    FROM BMSIW.LABOR_ALL_UV A INNER JOIN BMSIW.GLBL_DEPT_REF_UV B ON A.EMP_DEPT_NUMBER = B.DPT_ID AND A.COUNTRY_CODE = B.COUNTRY_CD
+    WHERE A.WEEK_ENDING_DATE >= '{week_end_date}' 
+      AND A.COUNTRY_CODE = '709'
+      AND A.EMP_COMPANY_CODE IN ('IGSI', 'INUSB', 'NETSOL')
+      AND A.LAB_STATUS = 'ACTIVE'
+      AND A.EMP_SER_NUM IN {Account_list}
+      AND A.EMP_DEPT_NUMBER = B.DPT_ID         
+      AND B.LEDGER_CD IN ('61', '51')
+      
+    GROUP BY A.EMP_SER_NUM, A.ACCOUNT_ID, A.WEEK_ENDING_DATE, A.EMP_COMPANY_CODE, 
+             A.EMP_DEPT_NUMBER, A.ACTIVITY_CD, A.EMP_LEVEL_CODE, A.JOB_FAMILY_CODE, A.OVERTIME_IND, B.RQSTR_EMAIL
+    """    
+
+    tableResult = pd.read_sql(query, conn1)
+    tableResult = pd.DataFrame(tableResult)
+    Account_data = tableResult
+    #print(len(tableResult))
+
+    try:
+
+        if len(finaldf) > 0:
+            finaldf = pd.concat([finaldf, Account_data])
+            #finaldf.to_excel('test2.xlsx')
+
+        else:
+            finaldf = Account_data
+            #finaldf.to_excel('test3.xlsx')
+
+    except:
+        finaldf = Account_data
+        #finaldf.to_excel('test1.xlsx')
+
+Account_report = EMF_DATA_AND_SOURCE.loc[:,['EMP_SER_NUM','WEEKENDING']]
+#Account_report = Account_report.reset_index(inplace=True)
+
+size = 100
+initial_val = 0
+final_val = len(Account_report)
+if final_val >= size:
+    end_value = size
+else:
+    end_value = final_val
+
+balance = final_val - end_value + 1
+i = 1
+while balance > 0:
+    print(i)
+    #newdf = 'newdf' + str(i)
+    newdf = Account_report.loc[initial_val:end_value-1]
+    sqlrun()
+    #newdf.to_excel('Output'+str(i)+'.xlsx', index = False)
+    initial_val = end_value
+    balance = final_val - end_value
+    #print(balance)
+
+    if balance <= size:
+        final = Account_report.loc[initial_val:(initial_val+balance)]
+        print('Final run')
+        #final.to_excel('Output'+str(i+1)+'.xlsx', index = False)
+        newdf = final
+        if balance > 1:
+            sqlrun()
+        break
+    else:
+        end_value = end_value + size
+    i = i+1
+
+tableResult = finaldf
+
+Labor_clocking=pd.DataFrame(tableResult)
+Labor_clocking.EMP_COMPANY_CODE = Labor_clocking.EMP_COMPANY_CODE.str.strip()
+Labor_clocking = pd.merge(Labor_clocking, EMF_DATA_AND_SOURCE,left_on=['EMP_SER_NUM','EMP_COMPANY_CODE'],right_on=['EMP_SER_NUM','COMPANY_CODE'],how='left')
+Labor_clocking.to_excel(r'LABOR CLOCKING_NON GBS.xlsx',index= None,header=True)
+
+Labor_clocking.EMP_LEVEL_CODE = Labor_clocking.EMP_LEVEL_CODE.astype(str)
+Labor_clocking.EMP_LEVEL_CODE_x = Labor_clocking.EMP_LEVEL_CODE_x.astype(str)
+Labor_clocking.EMP_LEVEL_CODE_y = Labor_clocking.EMP_LEVEL_CODE_y.astype(str)
+Labor_clocking.rename(index = str, columns={'JOB_FAMILY_CODE_x':'JOB_FAMILY_CODE_LABOR', 'JOB_FAMILY_CODE_y':'JOB_FAMILY_CODE_EMF'},inplace=True)
+
+Labor_clocking_cleaned = Labor_clocking.loc[Labor_clocking.WEEK_ENDING_DATE > Labor_clocking.SRC_LOCAL_BAND_EFFCTV_DT]
+Labor_clocking_cleaned = Labor_clocking_cleaned.loc[Labor_clocking_cleaned.EMP_LEVEL_CODE != Labor_clocking_cleaned.EMP_LEVEL_CODE_x, :]
+Labor_clocking_cleaned.to_excel('labor_emf_data_cleaned_GBS.xlsx',index=False)
+EMF_UPDATE = Labor_clocking_cleaned.loc[Labor_clocking_cleaned.EMP_LEVEL_CODE_x != Labor_clocking_cleaned.EMP_LEVEL_CODE_y, ['EMP_SER_NUM','COMPANY_CODE','EMP_LEVEL_CODE_x','EMP_LEVEL_CODE_y']]
+EMF_UPDATE.drop_duplicates(inplace=True)
+
+labor_emf_data_cleaned_GBS_path = "labor_emf_data_cleaned_GBS.xlsx"
+Labor_clocking_cleaned.to_excel(labor_emf_data_cleaned_GBS_path, index=False)
+print("Labor data cleaned and saved.")
+
+Band_emf_update_IGSI = EMF_UPDATE.loc[EMF_UPDATE.COMPANY_CODE == 'IGSI', :]
+Band_emf_update_INUSB = EMF_UPDATE.loc[EMF_UPDATE.COMPANY_CODE == 'INUSB', :]
+Band_emf_update_NETSOL = EMF_UPDATE.loc[EMF_UPDATE.COMPANY_CODE == 'NETSOL', :]
+
+JFC_UPDATE = Labor_clocking_cleaned.loc[Labor_clocking_cleaned.JOB_FAMILY_CODE_LABOR != Labor_clocking_cleaned.JOB_FAMILY_CODE_EMF, ['EMP_SER_NUM','COMPANY_CODE','JOB_FAMILY_CODE_LABOR','JOB_FAMILY_CODE_EMF']]
+JFC_UPDATE.drop_duplicates(inplace=True)
+
+JFC_emf_update_IGSI = JFC_UPDATE.loc[JFC_UPDATE.COMPANY_CODE == 'IGSI', :]
+JFC_emf_update_INUSB = JFC_UPDATE.loc[JFC_UPDATE.COMPANY_CODE == 'INUSB', :]
+JFC_emf_update_NETSOL = JFC_UPDATE.loc[JFC_UPDATE.COMPANY_CODE == 'NETSOL', :]
+
+DISCON_UPDATE = Labor_clocking_cleaned.loc[Labor_clocking_cleaned.EMP_DISCON_DATE.astype(str) != '99999999', ['EMP_SER_NUM','COMPANY_CODE','EMP_DISCON_DATE']]
+DISCON_UPDATE.drop_duplicates(inplace=True)
+
+Discon_emf_update_IGSI = DISCON_UPDATE.loc[DISCON_UPDATE.COMPANY_CODE == 'IGSI', :]
+Discon_emf_update_INUSB = DISCON_UPDATE.loc[DISCON_UPDATE.COMPANY_CODE == 'INUSB', :]
+Discon_emf_update_NETSOL = DISCON_UPDATE.loc[DISCON_UPDATE.COMPANY_CODE == 'NETSOL', :]
+
+Labor_clocking_cleaned['WEEK_ENDING_\DATE'] = pd.to_datetime(Labor_clocking_cleaned['WEEK_ENDING_DATE'])
+emp_weekending = Labor_clocking_cleaned.groupby(['EMP_SER_NUM','EMP_COMPANY_CODE']).WEEK_ENDING_DATE.agg(['min','max'])
+emp_weekending = emp_weekending.astype(str)
+emp_weekending.reset_index(level=1, inplace=True)
+igsi_weekending  = emp_weekending.loc[emp_weekending.EMP_COMPANY_CODE == 'IGSI']
+inusb_weekending  = emp_weekending.loc[emp_weekending.EMP_COMPANY_CODE == 'INUSB']
+netsol_weekending  = emp_weekending.loc[emp_weekending.EMP_COMPANY_CODE == 'NETSOL']
+
+writer = pd.ExcelWriter("NON_GBS_FINAL MOVE HOURS_2024.xlsx", engine='xlsxwriter')
+igsi_weekending.to_excel(writer, sheet_name='MoveHoursIGSI')
+inusb_weekending.to_excel(writer, sheet_name='MoveHoursINUSB')
+netsol_weekending.to_excel(writer, sheet_name='MoveHoursNETSOL')
+Discon_emf_update_IGSI.to_excel(writer,sheet_name='Discon_IGSI',index=False)
+Discon_emf_update_INUSB.to_excel(writer,sheet_name='Discon_INUSB',index=False)
+Discon_emf_update_NETSOL.to_excel(writer,sheet_name='Discon_NETSOL',index=False)
+JFC_emf_update_IGSI.to_excel(writer,sheet_name='JFC_IGSI',index=False)
+JFC_emf_update_INUSB.to_excel(writer,sheet_name='JFC_INUSB',index=False)
+JFC_emf_update_NETSOL.to_excel(writer,sheet_name='JFC_NETSOL',index=False)
+Band_emf_update_IGSI.to_excel(writer,sheet_name='Band_IGSI',index=False)
+Band_emf_update_INUSB.to_excel(writer,sheet_name='Band_INUSB',index=False)
+Band_emf_update_NETSOL.to_excel(writer,sheet_name='Band_NETSOL',index=False)
+#writer.save()
+
+output_path = os.path.join(path, "output")
+output_file = "NON_GBS_FINAL_MOVE_HOURS_2025.xlsx"
+
+output_full_path = os.path.join(output_path, output_file)
+
+os.chdir(path+ "/output")
+with pd.ExcelWriter(output_full_path, engine='xlsxwriter') as writer:
+    igsi_weekending.to_excel(writer, sheet_name='MoveHoursIGSI')
+    inusb_weekending.to_excel(writer, sheet_name='MoveHoursINUSB')
+    netsol_weekending.to_excel(writer, sheet_name='MoveHoursNETSOL')
+    Discon_emf_update_IGSI.to_excel(writer, sheet_name='Discon_IGSI', index=False)
+    Discon_emf_update_INUSB.to_excel(writer, sheet_name='Discon_INUSB', index=False)
+    Discon_emf_update_NETSOL.to_excel(writer, sheet_name='Discon_NETSOL', index=False)
+    JFC_emf_update_IGSI.to_excel(writer, sheet_name='JFC_IGSI', index=False)
+    JFC_emf_update_INUSB.to_excel(writer, sheet_name='JFC_INUSB', index=False)
+    JFC_emf_update_NETSOL.to_excel(writer, sheet_name='JFC_NETSOL', index=False)
+    Band_emf_update_IGSI.to_excel(writer, sheet_name='Band_IGSI', index=False)
+    Band_emf_update_INUSB.to_excel(writer, sheet_name='Band_INUSB', index=False)
+    Band_emf_update_NETSOL.to_excel(writer, sheet_name='Band_NETSOL', index=False)
+
+os.chdir(path)
+def data_transfer(company_cd,category):
+    rowval = 2
+    colval = 1
+    rtrowval = 8
+    rtcolval = 2
+    wb = openpyxl.load_workbook(os.getcwd() + '//template//' + category + company_cd +  '.xlsm', keep_vba=True)
+    writesh = wb["Sheet1"]
+
+    while readsh.cell(rowval, colval).value is not None:
+        while readsh.cell(rowval, colval).value is not None:
+            writesh.cell(rtrowval, rtcolval).value = readsh.cell(rowval, colval).value
+            rtcolval = rtcolval + 1
+            colval = colval + 1
+        colval = 1
+        rtcolval = 2
+        rtrowval = rtrowval + 1
+        rowval = rowval + 1
+
+    wb.save(os.getcwd() + '/output/' + company_cd + '-' + category + '.xlsx')
+    wb.close()
+
+output_path = os.path.join(path, "output")
+wb1 = openpyxl.load_workbook(os.getcwd()+'/FINAL MOVE HOURS.xlsx')
+sheets = wb1.sheetnames
+print(sheets)
+
+for sheet in sheets:
+    readsh  = wb1[sheet]
+    if sheet[:3] == 'JFC':
+        category = 'JFC'
+    elif sheet[:4] == 'Band':
+        category = 'Band'
+    elif sheet[:6] == 'Discon':
+        category = 'Discon'
+    elif sheet[:4] == 'Move':
+        category = 'MoveHours'
+    else:
+        category = None
+
+    if sheet[-4:] == 'IGSI':
+        company_cd = 'IGSI'
+    elif sheet[-5:] == 'INUSB':
+        company_cd = 'INUSB'
+    else:
+        company_cd = 'NETSOL'
+  
+
+    rowval = 2
+    colval = 1
+    if category is not None:
+        if readsh.cell(rowval, colval).value is not None:
+            data_transfer(company_cd,category)
+
+wb1.close
+
+output_path = os.path.join(path, "output")
+output_file = "labor_emf_data_cleaned_GBS.xlsx"
+output_full_path = os.path.join(output_path, output_file)
+os.chdir(path+ "/output")
+
+
